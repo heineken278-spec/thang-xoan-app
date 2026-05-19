@@ -55,6 +55,13 @@
   .vbtn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .vbtn:hover { filter: brightness(1.1); }
   #rulerToggle.on { background: #c84a3a; border-color: #c84a3a; color: #fff; }
+  .axisrow { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; margin-top: 6px; }
+  .axisbtn {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 4px; font-size: 11px; cursor: pointer;
+  }
+  .axisbtn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .axisbtn:hover { filter: brightness(1.15); }
   select {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px;
@@ -204,7 +211,12 @@
       <button type="button" class="vbtn" data-vm="side">Chiếu cạnh</button>
     </div>
     <button type="button" class="btn secondary" id="rulerToggle" style="margin-top:10px">📏 Bật thước đo</button>
-    <div style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.4">Thước đo chỉ hoạt động ở 3 chế độ chiếu — kích thước thật theo mm.</div>
+    <div class="axisrow">
+      <button type="button" class="axisbtn active" data-axis="free">Tự do</button>
+      <button type="button" class="axisbtn" data-axis="h">Ngang ⇿</button>
+      <button type="button" class="axisbtn" data-axis="v">Dọc ⇕</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.4">Thước đo chỉ hoạt động ở 3 chế độ chiếu. Khóa trục để đo thẳng theo phương ngang hoặc dọc.</div>
   </div>
 
   <div class="group">
@@ -250,7 +262,7 @@ const canvas = document.getElementById("canvas3d");
 const ctx = canvas.getContext("2d");
 const view = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0, mode: '3d', ortho: false, orthoScale: 200 };
 const DEFAULT_VIEW = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0 };
-const ruler = { active: false, pts: [] };
+const ruler = { active: false, pts: [], axis: 'free' };
 let DPR = window.devicePixelRatio || 1;
 
 // light direction in world space (normalized)
@@ -409,13 +421,15 @@ function buildScene() {
     // helical: hai dầm xoắn liên tục (stringer), không có trụ giữa
     const sDepth = Math.max(0.26, riser * 1.7); // chiều cao tiết diện dầm
     const ribbon = (radius, halfW) => {
-      const samples = Math.max(28, N * 6);
+      const samples = Math.max(32, N * 8);
       const top = [], bot = [];
       for (let s = 0; s <= samples; s++) {
         const t = (s / samples) * N;
         const a = t * aStep;
-        const yT = (t + 0.5) * riser;          // mép trên dầm bám theo mũi bậc
-        const yB = yT - sDepth;
+        // top edge bám đúng vào mũi bậc; cap ở mặt sàn trên
+        const yT = Math.min((t + 1) * riser, N * riser);
+        // bottom edge KHÔNG được tụt xuống dưới sàn (y=0)
+        const yB = Math.max(0, yT - sDepth);
         const ca = Math.cos(a), sa = Math.sin(a);
         const rO = radius + halfW, rI = radius - halfW;
         top.push([[rO*ca, yT-cY, rO*sa], [rI*ca, yT-cY, rI*sa]]);
@@ -628,6 +642,18 @@ function render() {
     ctx.save();
     ctx.font = "bold 13px Segoe UI, sans-serif";
     const sp = ruler.pts.map(wp => project(wp[0], wp[1], wp[2], w, h));
+    // guideline khi đã có 1 điểm và đang khóa trục
+    if (sp.length === 1 && ruler.axis !== 'free') {
+      const p = sp[0];
+      ctx.strokeStyle = "rgba(255,100,80,0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 6]);
+      ctx.beginPath();
+      if (ruler.axis === 'h') { ctx.moveTo(0, p.sy); ctx.lineTo(w, p.sy); }
+      else { ctx.moveTo(p.sx, 0); ctx.lineTo(p.sx, h); }
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     sp.forEach((p, i) => {
       ctx.strokeStyle = "#ff6450"; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(p.sx, p.sy, 6, 0, Math.PI * 2); ctx.stroke();
@@ -836,7 +862,14 @@ window.addEventListener("mouseup", e => {
     // treat as click — ruler tool
     if (ruler.active && view.ortho) {
       const rect = canvas.getBoundingClientRect();
-      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      let px = e.clientX - rect.left, py = e.clientY - rect.top;
+      // axis snap: lock point 2 to share screen-X or screen-Y with point 1
+      if (ruler.pts.length === 1 && ruler.axis !== 'free') {
+        const w = canvas.clientWidth, h = canvas.clientHeight;
+        const p1 = project(ruler.pts[0][0], ruler.pts[0][1], ruler.pts[0][2], w, h);
+        if (ruler.axis === 'h') py = p1.sy;       // khóa trục ngang
+        else if (ruler.axis === 'v') px = p1.sx;  // khóa trục dọc
+      }
       if (ruler.pts.length >= 2) ruler.pts = [];
       ruler.pts.push(unproject(px, py));
     }
@@ -938,6 +971,13 @@ document.getElementById('rulerToggle').addEventListener('click', () => {
   ruler.active = !ruler.active;
   if (!ruler.active) ruler.pts = [];
   updateRulerBtn();
+});
+
+document.querySelectorAll('.axisbtn').forEach(b => {
+  b.addEventListener('click', () => {
+    ruler.axis = b.dataset.axis;
+    document.querySelectorAll('.axisbtn').forEach(x => x.classList.toggle('active', x.dataset.axis === ruler.axis));
+  });
 });
 
 // ================= EXPORT =================
@@ -1121,21 +1161,23 @@ function buildSketchUpRuby() {
     L.push("S_HALFW = 40.mm");
     L.push("");
     L.push("def make_stringer(ents, radius, half_w, depth, n_steps, a_step, riser, mat, name)");
-    L.push("  samples = n_steps * 6");
+    L.push("  samples = n_steps * 8");
     L.push("  grp = ents.add_group");
-    L.push("  ring = lambda do |t, y_off|");
+    L.push("  # mép trên bám mũi bậc, cap ở sàn trên; mép dưới không tụt xuống dưới sàn (z=0)");
+    L.push("  ring_at = lambda do |t, is_top|");
     L.push("    a = t * a_step");
-    L.push("    y_t = (t + 0.5) * riser + y_off");
+    L.push("    y_t = [(t + 1) * riser, n_steps * riser].min");
+    L.push("    z = is_top ? y_t : [y_t - depth, 0].max");
     L.push("    [");
-    L.push("      Geom::Point3d.new((radius+half_w)*Math.cos(a), (radius+half_w)*Math.sin(a), y_t),");
-    L.push("      Geom::Point3d.new((radius-half_w)*Math.cos(a), (radius-half_w)*Math.sin(a), y_t)");
+    L.push("      Geom::Point3d.new((radius+half_w)*Math.cos(a), (radius+half_w)*Math.sin(a), z),");
+    L.push("      Geom::Point3d.new((radius-half_w)*Math.cos(a), (radius-half_w)*Math.sin(a), z)");
     L.push("    ]");
     L.push("  end");
     L.push("  (0...samples).each do |s|");
     L.push("    t0 = s.to_f      / samples * n_steps");
     L.push("    t1 = (s+1).to_f  / samples * n_steps");
-    L.push("    top0 = ring.call(t0, 0);      top1 = ring.call(t1, 0)");
-    L.push("    bot0 = ring.call(t0, -depth); bot1 = ring.call(t1, -depth)");
+    L.push("    top0 = ring_at.call(t0, true);  top1 = ring_at.call(t1, true)");
+    L.push("    bot0 = ring_at.call(t0, false); bot1 = ring_at.call(t1, false)");
     L.push("    [");
     L.push("      [top0[0], top1[0], bot1[0], bot0[0]],");
     L.push("      [top0[1], top1[1], bot1[1], bot0[1]],");
@@ -1145,7 +1187,7 @@ function buildSketchUpRuby() {
     L.push("  end");
     L.push("  # nắp 2 đầu");
     L.push("  [0.0, n_steps.to_f].each do |t|");
-    L.push("    rt = ring.call(t, 0); rb = ring.call(t, -depth)");
+    L.push("    rt = ring_at.call(t, true); rb = ring_at.call(t, false)");
     L.push("    grp.entities.add_face([rt[0], rt[1], rb[1], rb[0]]) rescue nil");
     L.push("  end");
     L.push("  grp.material = mat");
