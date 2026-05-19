@@ -46,6 +46,15 @@
     font-variant-numeric: tabular-nums;
   }
   .ctrl input[type=number]:focus { outline: 1px solid var(--accent); }
+  .viewbtns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .vbtn {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 8px 4px; font-size: 12px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .vbtn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .vbtn:hover { filter: brightness(1.1); }
+  #rulerToggle.on { background: #c84a3a; border-color: #c84a3a; color: #fff; }
   select {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px;
@@ -187,9 +196,22 @@
   </div>
 
   <div class="group">
+    <h2>Chế độ xem</h2>
+    <div class="viewbtns">
+      <button type="button" class="vbtn active" data-vm="3d">3D phối cảnh</button>
+      <button type="button" class="vbtn" data-vm="top">Chiếu bằng</button>
+      <button type="button" class="vbtn" data-vm="front">Chiếu đứng</button>
+      <button type="button" class="vbtn" data-vm="side">Chiếu cạnh</button>
+    </div>
+    <button type="button" class="btn secondary" id="rulerToggle" style="margin-top:10px">📏 Bật thước đo</button>
+    <div style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.4">Thước đo chỉ hoạt động ở 3 chế độ chiếu — kích thước thật theo mm.</div>
+  </div>
+
+  <div class="group">
     <h2>Xuất kết quả</h2>
     <button class="btn" id="exportPng">Chụp ảnh 3D (PNG)</button>
     <button class="btn secondary" id="exportPlan">Xuất bản vẽ mặt bằng 2D</button>
+    <button class="btn secondary" id="exportSketchUp">Xuất SketchUp Ruby (.rb)</button>
     <button class="btn secondary" id="resetView">Đưa góc nhìn về mặc định</button>
   </div>
 </div>
@@ -226,8 +248,9 @@ const P = {
 // ================= 3D MINI ENGINE (pure canvas) =================
 const canvas = document.getElementById("canvas3d");
 const ctx = canvas.getContext("2d");
-const view = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0 };
+const view = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0, mode: '3d', ortho: false, orthoScale: 200 };
 const DEFAULT_VIEW = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0 };
+const ruler = { active: false, pts: [] };
 let DPR = window.devicePixelRatio || 1;
 
 // light direction in world space (normalized)
@@ -250,9 +273,34 @@ function rotPoint(x, y, z) {
   return [X, Y2, Z2];
 }
 
+// Inverse projection (ortho only): screen px → world point on plane through origin
+function unproject(sx, sy) {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const f = view.orthoScale;
+  const r0 = (sx - w/2 - view.panX) / f;
+  const r1 = (h/2 + view.panY - sy) / f;
+  const r2 = 0; // point on view-plane through origin
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  const Y1 =  r1 * cp + r2 * sp;
+  const Z1 = -r1 * sp + r2 * cp;
+  const X1 = r0;
+  const cy = Math.cos(view.yaw), syy = Math.sin(view.yaw);
+  const x =  X1 * cy + Z1 * syy;
+  const z = -X1 * syy + Z1 * cy;
+  return [x, Y1, z];
+}
+
 function project(x, y, z, w, h) {
   const r = rotPoint(x, y, z);
   const depth = view.dist - r[2];           // larger = farther
+  if (view.ortho) {
+    const f = view.orthoScale;              // px per meter
+    return {
+      sx: w / 2 + r[0] * f + view.panX,
+      sy: h / 2 - r[1] * f + view.panY,
+      depth: depth,
+    };
+  }
   const denom = Math.max(depth, 0.15);
   const focal = Math.min(w, h) * 1.05;
   const f = focal / denom;
@@ -575,9 +623,49 @@ function render() {
   items.sort((a, b) => b.depth - a.depth);
   for (const it of items) it.draw();
 
-  // overlay: height label
+  // Ruler overlay (ortho modes only) — re-project world points each frame
+  if (ruler.active && view.ortho && ruler.pts.length > 0) {
+    ctx.save();
+    ctx.font = "bold 13px Segoe UI, sans-serif";
+    const sp = ruler.pts.map(wp => project(wp[0], wp[1], wp[2], w, h));
+    sp.forEach((p, i) => {
+      ctx.strokeStyle = "#ff6450"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.sx, p.sy, 6, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = "#ff6450";
+      ctx.fillText(String(i + 1), p.sx + 9, p.sy - 8);
+    });
+    if (sp.length === 2) {
+      const [a, b] = sp;
+      ctx.strokeStyle = "#ff6450"; ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath(); ctx.moveTo(a.sx, a.sy); ctx.lineTo(b.sx, b.sy); ctx.stroke();
+      ctx.setLineDash([]);
+      // distance in WORLD millimetres
+      const wp0 = ruler.pts[0], wp1 = ruler.pts[1];
+      const dxW = (wp1[0] - wp0[0]) * 1000;
+      const dyW = (wp1[1] - wp0[1]) * 1000;
+      const dzW = (wp1[2] - wp0[2]) * 1000;
+      const dist = Math.hypot(dxW, dyW, dzW);
+      const mx = (a.sx + b.sx) / 2, my = (a.sy + b.sy) / 2;
+      const horiz = Math.hypot(dxW, dzW);
+      const txt = `${dist.toFixed(0)} mm  (ngang ${horiz.toFixed(0)} · cao ${Math.abs(dyW).toFixed(0)})`;
+      ctx.font = "bold 13px Segoe UI, sans-serif";
+      const tw = ctx.measureText(txt).width;
+      ctx.fillStyle = "rgba(255,100,80,0.95)";
+      ctx.fillRect(mx - tw / 2 - 8, my - 26, tw + 16, 22);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(txt, mx - tw / 2, my - 11);
+    }
+    ctx.restore();
+  }
+
+  // Overlay: mode label (top-left) + params (bottom-right)
   ctx.fillStyle = "rgba(230,231,234,0.85)";
   ctx.font = "12px Segoe UI, sans-serif";
+  const modeNames = { '3d': '3D phối cảnh', top: 'Chiếu bằng', front: 'Chiếu đứng', side: 'Chiếu cạnh' };
+  ctx.textAlign = "left";
+  const modeTxt = modeNames[view.mode] + (view.ortho ? `  ·  1 mm = ${(view.orthoScale/1000).toFixed(3)} px` : '');
+  ctx.fillText(modeTxt + (ruler.active ? '  ·  🔴 Thước đo bật' : ''), 12, h - 12);
   ctx.textAlign = "right";
   ctx.fillText(`Cao tầng ${fmt(P.floorHeight)} mm  ·  ${P.steps} bậc  ·  ${fmt(P.rotation)}°`, w - 12, h - 12);
   ctx.textAlign = "left";
@@ -737,26 +825,47 @@ function refresh() {
   render();
 }
 
-// ================= MOUSE / TOUCH ORBIT =================
-let dragging = false, lastX = 0, lastY = 0, shiftDown = false;
-canvas.addEventListener("mousedown", e => { dragging = true; lastX = e.clientX; lastY = e.clientY; shiftDown = e.shiftKey; });
-window.addEventListener("mouseup", () => dragging = false);
+// ================= MOUSE / TOUCH =================
+let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, didDrag = false;
+canvas.addEventListener("mousedown", e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  downX = e.clientX; downY = e.clientY; didDrag = false;
+});
+window.addEventListener("mouseup", e => {
+  if (dragging && !didDrag) {
+    // treat as click — ruler tool
+    if (ruler.active && view.ortho) {
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      if (ruler.pts.length >= 2) ruler.pts = [];
+      ruler.pts.push(unproject(px, py));
+    }
+  }
+  dragging = false;
+});
 window.addEventListener("mousemove", e => {
   if (!dragging) return;
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
   lastX = e.clientX; lastY = e.clientY;
-  if (e.shiftKey || shiftDown) {
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 4) didDrag = true;
+  if (view.ortho) {
+    // ortho: always pan
+    view.panX += dx; view.panY += dy;
+  } else if (e.shiftKey) {
     view.panX += dx; view.panY += dy;
   } else {
     view.yaw += dx * 0.01;
     view.pitch = Math.max(-1.4, Math.min(1.4, view.pitch + dy * 0.01));
   }
-  render();
 });
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
-  view.dist = Math.max(2, Math.min(20, view.dist + e.deltaY * 0.004));
-  render();
+  if (view.ortho) {
+    const factor = e.deltaY > 0 ? 0.9 : 1.111;
+    view.orthoScale *= factor;
+  } else {
+    view.dist = Math.max(2, Math.min(20, view.dist + e.deltaY * 0.004));
+  }
 }, { passive: false });
 
 // touch
@@ -782,6 +891,54 @@ canvas.addEventListener("touchmove", e => {
     render();
   }
 }, { passive: true });
+
+// ================= VIEW MODES + RULER =================
+function fitOrtho() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) { setTimeout(fitOrtho, 60); return; }
+  const mm = 0.001;
+  const outR = Math.max(P.outerRadius, P.innerRadius + 200) * mm;
+  const totH = P.floorHeight * mm;
+  let extent;
+  if (view.mode === 'top') extent = outR * 2.2;
+  else extent = Math.max(outR * 2.2, totH * 1.15);
+  view.orthoScale = Math.min(w, h) / extent;
+  view.panX = 0; view.panY = 0;
+}
+
+function updateRulerBtn() {
+  const btn = document.getElementById('rulerToggle');
+  btn.classList.toggle('on', ruler.active);
+  btn.textContent = ruler.active ? '📏 Tắt thước đo' : '📏 Bật thước đo';
+}
+
+function setViewMode(mode) {
+  view.mode = mode;
+  if (mode === '3d') {
+    view.ortho = false;
+    view.yaw = DEFAULT_VIEW.yaw; view.pitch = DEFAULT_VIEW.pitch;
+    view.dist = DEFAULT_VIEW.dist; view.panX = 0; view.panY = 0;
+    ruler.active = false; ruler.pts = []; updateRulerBtn();
+  } else {
+    view.ortho = true;
+    if (mode === 'top')        { view.yaw = 0;          view.pitch = Math.PI/2; }
+    else if (mode === 'front') { view.yaw = 0;          view.pitch = 0; }
+    else if (mode === 'side')  { view.yaw = Math.PI/2;  view.pitch = 0; }
+    fitOrtho();
+  }
+  document.querySelectorAll('.vbtn').forEach(b => b.classList.toggle('active', b.dataset.vm === mode));
+}
+
+document.querySelectorAll('.vbtn').forEach(b => {
+  b.addEventListener('click', () => setViewMode(b.dataset.vm));
+});
+
+document.getElementById('rulerToggle').addEventListener('click', () => {
+  if (!view.ortho) setViewMode('top');
+  ruler.active = !ruler.active;
+  if (!ruler.active) ruler.pts = [];
+  updateRulerBtn();
+});
 
 // ================= EXPORT =================
 document.getElementById("exportPng").addEventListener("click", () => {
@@ -866,9 +1023,194 @@ document.getElementById("exportPlan").addEventListener("click", () => {
   a.click();
 });
 
+// ---- SketchUp Ruby export ----
+function buildSketchUpRuby() {
+  const innerR = P.innerRadius;
+  const outerR = Math.max(P.outerRadius, P.innerRadius + 200);
+  const riser = P.floorHeight / P.steps;
+  const N = P.steps;
+  const L = [];
+  L.push("# encoding: utf-8");
+  L.push("# Spiral Staircase generator — Mô phỏng thang xoắn");
+  L.push("# Cách dùng: mở SketchUp → Window → Ruby Console → dán toàn bộ file này vào → Enter");
+  L.push("# (hoặc đặt file vào thư mục Plugins của SketchUp rồi 'load'.)");
+  L.push("# Sinh tự động ngày " + new Date().toISOString().slice(0,10));
+  L.push("");
+  L.push("model = Sketchup.active_model");
+  L.push("ents  = model.active_entities");
+  L.push("model.start_operation('Thang xoan', true)");
+  L.push("");
+  L.push("# === Thông số ===");
+  L.push(`STAIR_TYPE  = "${P.type}"`);
+  L.push(`INNER_R     = ${innerR}.mm`);
+  L.push(`OUTER_R     = ${outerR}.mm`);
+  L.push(`RISER       = ${riser.toFixed(4)}.mm`);
+  L.push(`STEP_THICK  = ${P.stepThickness}.mm`);
+  L.push(`N_STEPS     = ${N}`);
+  L.push(`FLOOR_H     = ${P.floorHeight}.mm`);
+  L.push(`TOTAL_ROT   = ${P.rotation}.degrees`);
+  L.push(`DIR_SIGN    = ${P.direction}`);
+  L.push(`A_STEP      = TOTAL_ROT / N_STEPS * DIR_SIGN`);
+  L.push(`RAIL_H      = ${P.handrailHeight}.mm`);
+  L.push("");
+  L.push("# === Vật liệu ===");
+  L.push("def get_mat(model, name, r, g, b, alpha=1.0)");
+  L.push("  m = model.materials[name] || model.materials.add(name)");
+  L.push("  m.color = Sketchup::Color.new(r, g, b)");
+  L.push("  m.alpha = alpha");
+  L.push("  m");
+  L.push("end");
+  L.push("MAT_TREAD   = get_mat(model, 'Tread_Oak',   210, 165, 110)");
+  L.push("MAT_STRING  = get_mat(model, 'Stringer',    228, 231, 236)");
+  L.push("MAT_COLUMN  = get_mat(model, 'Column',      150, 155, 165)");
+  L.push("MAT_SLAB    = get_mat(model, 'Landing',     150, 155, 165)");
+  L.push("MAT_RAIL    = get_mat(model, 'Handrail',    120, 128, 140)");
+  L.push("MAT_GLASS   = get_mat(model, 'Glass',       150, 195, 215, 0.4)");
+  L.push("");
+  L.push("# === Helper: tạo 1 bậc dạng quạt khuyên ===");
+  L.push("def make_tread(ents, in_r, out_r, a0, a1, y_top, thick, mat, segs=16)");
+  L.push("  grp = ents.add_group");
+  L.push("  pts = []");
+  L.push("  (0..segs).each { |s| a = a0 + (a1-a0)*s.to_f/segs; pts << Geom::Point3d.new(out_r*Math.cos(a), out_r*Math.sin(a), y_top) }");
+  L.push("  segs.downto(0) { |s| a = a0 + (a1-a0)*s.to_f/segs; pts << Geom::Point3d.new(in_r*Math.cos(a),  in_r*Math.sin(a),  y_top) }");
+  L.push("  face = grp.entities.add_face(pts)");
+  L.push("  face.reverse! if face.normal.z < 0");
+  L.push("  face.pushpull(-thick)");
+  L.push("  grp.material = mat");
+  L.push("  grp.name = 'Bậc thang'");
+  L.push("  grp");
+  L.push("end");
+  L.push("");
+  L.push("# === Các bậc thang ===");
+  L.push("N_STEPS.times do |i|");
+  L.push("  a0 = i * A_STEP");
+  L.push("  a1 = a0 + A_STEP");
+  L.push("  y_top = (i + 1) * RISER");
+  L.push("  make_tread(ents, INNER_R, OUTER_R, a0, a1, y_top, STEP_THICK, MAT_TREAD)");
+  L.push("end");
+  L.push("");
+  L.push("# === Bản chiếu tới (sàn tầng trên) ===");
+  L.push("a0 = N_STEPS * A_STEP; a1 = a0 + A_STEP");
+  L.push("make_tread(ents, INNER_R, OUTER_R, a0, a1, FLOOR_H, STEP_THICK, MAT_SLAB)");
+  L.push("");
+  if (P.type === 'column') {
+    L.push("# === Trụ tròn trung tâm ===");
+    L.push("col_grp = ents.add_group");
+    L.push("circle_edges = col_grp.entities.add_circle(Geom::Point3d.new(0,0,0), Geom::Vector3d.new(0,0,1), INNER_R, 36)");
+    L.push("col_face = col_grp.entities.add_face(circle_edges)");
+    L.push("col_face.reverse! if col_face.normal.z < 0");
+    L.push("col_face.pushpull(FLOOR_H)");
+    L.push("col_grp.material = MAT_COLUMN");
+    L.push("col_grp.name = 'Trụ trung tâm'");
+    L.push("");
+    L.push("# === Lan can: thanh đứng ===");
+    L.push("bal_r = OUTER_R - 20.mm");
+    L.push("rail_pts = []");
+    L.push("N_STEPS.times do |i|");
+    L.push("  a = i * A_STEP + A_STEP * 0.5");
+    L.push("  y = (i + 1) * RISER");
+    L.push("  bx, by = bal_r*Math.cos(a), bal_r*Math.sin(a)");
+    L.push("  bal = ents.add_group");
+    L.push("  bal_edges = bal.entities.add_edges(Geom::Point3d.new(bx, by, y), Geom::Point3d.new(bx, by, y + RAIL_H))");
+    L.push("  bal.name = 'Thanh đứng'");
+    L.push("  rail_pts << Geom::Point3d.new(bx, by, y + RAIL_H)");
+    L.push("end");
+  } else {
+    L.push("# === Dầm xoắn liên tục (stringer) — không trụ giữa ===");
+    L.push("S_DEPTH = [260.mm, RISER * 1.7].max");
+    L.push("S_HALFW = 40.mm");
+    L.push("");
+    L.push("def make_stringer(ents, radius, half_w, depth, n_steps, a_step, riser, mat, name)");
+    L.push("  samples = n_steps * 6");
+    L.push("  grp = ents.add_group");
+    L.push("  ring = lambda do |t, y_off|");
+    L.push("    a = t * a_step");
+    L.push("    y_t = (t + 0.5) * riser + y_off");
+    L.push("    [");
+    L.push("      Geom::Point3d.new((radius+half_w)*Math.cos(a), (radius+half_w)*Math.sin(a), y_t),");
+    L.push("      Geom::Point3d.new((radius-half_w)*Math.cos(a), (radius-half_w)*Math.sin(a), y_t)");
+    L.push("    ]");
+    L.push("  end");
+    L.push("  (0...samples).each do |s|");
+    L.push("    t0 = s.to_f      / samples * n_steps");
+    L.push("    t1 = (s+1).to_f  / samples * n_steps");
+    L.push("    top0 = ring.call(t0, 0);      top1 = ring.call(t1, 0)");
+    L.push("    bot0 = ring.call(t0, -depth); bot1 = ring.call(t1, -depth)");
+    L.push("    [");
+    L.push("      [top0[0], top1[0], bot1[0], bot0[0]],");
+    L.push("      [top0[1], top1[1], bot1[1], bot0[1]],");
+    L.push("      [top0[0], top1[0], top1[1], top0[1]],");
+    L.push("      [bot0[0], bot1[0], bot1[1], bot0[1]]");
+    L.push("    ].each { |pts| grp.entities.add_face(pts) rescue nil }");
+    L.push("  end");
+    L.push("  # nắp 2 đầu");
+    L.push("  [0.0, n_steps.to_f].each do |t|");
+    L.push("    rt = ring.call(t, 0); rb = ring.call(t, -depth)");
+    L.push("    grp.entities.add_face([rt[0], rt[1], rb[1], rb[0]]) rescue nil");
+    L.push("  end");
+    L.push("  grp.material = mat");
+    L.push("  grp.name = name");
+    L.push("  grp");
+    L.push("end");
+    L.push("");
+    L.push("make_stringer(ents, INNER_R, S_HALFW, S_DEPTH, N_STEPS, A_STEP, RISER, MAT_STRING, 'Dầm xoắn trong')");
+    L.push("make_stringer(ents, OUTER_R, S_HALFW, S_DEPTH, N_STEPS, A_STEP, RISER, MAT_STRING, 'Dầm xoắn ngoài')");
+    L.push("");
+    L.push("# === Lan can kính theo mép ngoài ===");
+    L.push("glass_grp = ents.add_group");
+    L.push("N_STEPS.times do |i|");
+    L.push("  a0 = i * A_STEP; a1 = a0 + A_STEP");
+    L.push("  y = (i + 1) * RISER");
+    L.push("  segs = 6");
+    L.push("  segs.times do |s|");
+    L.push("    aa0 = a0 + (a1-a0)*s.to_f/segs");
+    L.push("    aa1 = a0 + (a1-a0)*(s+1).to_f/segs");
+    L.push("    r = OUTER_R - 10.mm");
+    L.push("    pts = [");
+    L.push("      Geom::Point3d.new(r*Math.cos(aa0), r*Math.sin(aa0), y),");
+    L.push("      Geom::Point3d.new(r*Math.cos(aa1), r*Math.sin(aa1), y),");
+    L.push("      Geom::Point3d.new(r*Math.cos(aa1), r*Math.sin(aa1), y + RAIL_H),");
+    L.push("      Geom::Point3d.new(r*Math.cos(aa0), r*Math.sin(aa0), y + RAIL_H)");
+    L.push("    ]");
+    L.push("    glass_grp.entities.add_face(pts) rescue nil");
+    L.push("  end");
+    L.push("end");
+    L.push("glass_grp.material = MAT_GLASS");
+    L.push("glass_grp.name = 'Lan can kính'");
+    L.push("");
+    L.push("# Đường tay vịn (đường cong)");
+    L.push("rail_pts = []");
+    L.push("bal_r = OUTER_R - 20.mm");
+    L.push("N_STEPS.times do |i|");
+    L.push("  a = i * A_STEP + A_STEP * 0.5");
+    L.push("  y = (i + 1) * RISER");
+    L.push("  rail_pts << Geom::Point3d.new(bal_r*Math.cos(a), bal_r*Math.sin(a), y + RAIL_H)");
+    L.push("end");
+  }
+  L.push("a_top = N_STEPS * A_STEP + A_STEP * 0.5");
+  L.push("rail_pts << Geom::Point3d.new(bal_r*Math.cos(a_top), bal_r*Math.sin(a_top), FLOOR_H + RAIL_H)");
+  L.push("rail_grp = ents.add_group");
+  L.push("rail_grp.entities.add_curve(rail_pts)");
+  L.push("rail_grp.material = MAT_RAIL");
+  L.push("rail_grp.name = 'Tay vịn'");
+  L.push("");
+  L.push("model.commit_operation");
+  L.push("model.active_view.zoom_extents");
+  L.push("puts 'Đã tạo xong thang xoắn — ' + N_STEPS.to_s + ' bậc, ' + (FLOOR_H/1.mm).round.to_s + ' mm cao tầng.'");
+  return L.join("\n");
+}
+
+document.getElementById("exportSketchUp").addEventListener("click", () => {
+  const text = buildSketchUpRuby();
+  const blob = new Blob([text], { type: "text/x-ruby; charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `thang-xoan-sketchup-${Date.now()}.rb`;
+  a.click();
+});
+
 document.getElementById("resetView").addEventListener("click", () => {
-  Object.assign(view, DEFAULT_VIEW);
-  render();
+  setViewMode('3d');
 });
 
 // ================= INIT =================
