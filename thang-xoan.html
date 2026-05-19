@@ -262,7 +262,7 @@ const canvas = document.getElementById("canvas3d");
 const ctx = canvas.getContext("2d");
 const view = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0, mode: '3d', ortho: false, orthoScale: 200 };
 const DEFAULT_VIEW = { yaw: -0.7, pitch: 0.42, dist: 6.5, panX: 0, panY: 0 };
-const ruler = { active: false, pts: [], axis: 'free' };
+const ruler = { active: false, pts: [], axis: 'free', hover: null, mouse: null };
 let DPR = window.devicePixelRatio || 1;
 
 // light direction in world space (normalized)
@@ -534,6 +534,58 @@ function buildScene() {
   return { polys, lines, human, grid, cY, totalH, outerR };
 }
 
+// ================= SNAP POINTS (for ruler) =================
+function getSnapPoints() {
+  const m = 0.001;
+  const innerR = P.innerRadius * m;
+  const outerR = Math.max(P.outerRadius, P.innerRadius + 200) * m;
+  const riser = (P.floorHeight / P.steps) * m;
+  const thick = P.stepThickness * m;
+  const N = P.steps;
+  const aStep = (P.rotation * Math.PI / 180) / N * P.direction;
+  const totalH = P.floorHeight * m;
+  const cY = totalH / 2;
+  const pts = [];
+  const push = (x, y, z, label) => pts.push({ wp: [x, y - cY, z], label });
+  // 8 góc của mỗi bậc thang
+  for (let i = 0; i < N; i++) {
+    const a0 = i * aStep, a1 = a0 + aStep;
+    const topY = (i + 1) * riser, botY = topY - thick;
+    [[a0, 'đầu'], [a1, 'cuối']].forEach(([a, ae]) => {
+      [[innerR, 'trong'], [outerR, 'ngoài']].forEach(([r, re]) => {
+        [[topY, 'trên'], [botY, 'dưới']].forEach(([y, ye]) => {
+          push(r*Math.cos(a), y, r*Math.sin(a), `Bậc ${i+1} ${ae}-${re}-${ye}`);
+        });
+      });
+    });
+    // điểm giữa mũi bậc (mép trước, giữa độ rộng)
+    const aMid = a0;
+    const rMid = (innerR + outerR) / 2;
+    push(rMid*Math.cos(aMid), topY, rMid*Math.sin(aMid), `Mũi bậc ${i+1} (giữa)`);
+  }
+  // 8 góc bản chiếu tới (sàn tầng trên)
+  const aSlab0 = N * aStep, aSlab1 = aSlab0 + aStep;
+  [[aSlab0, 'đầu'], [aSlab1, 'cuối']].forEach(([a, ae]) => {
+    [[innerR, 'trong'], [outerR, 'ngoài']].forEach(([r, re]) => {
+      [[totalH, 'trên'], [totalH - thick, 'dưới']].forEach(([y, ye]) => {
+        push(r*Math.cos(a), y, r*Math.sin(a), `Sàn ${ae}-${re}-${ye}`);
+      });
+    });
+  });
+  // Tâm trục thẳng đứng tại sàn dưới và sàn trên
+  push(0, 0, 0, 'Tâm trục sàn dưới');
+  push(0, totalH, 0, 'Tâm trục sàn trên');
+  // Trụ tròn (chỉ với loại có trụ): 8 điểm chu vi tại sàn dưới + trên
+  if (P.type === 'column') {
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2;
+      push(innerR*Math.cos(a), 0,      innerR*Math.sin(a), `Trụ - chân ${k+1}`);
+      push(innerR*Math.cos(a), totalH, innerR*Math.sin(a), `Trụ - đỉnh ${k+1}`);
+    }
+  }
+  return pts;
+}
+
 // ================= RENDER =================
 function render() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -637,6 +689,36 @@ function render() {
   items.sort((a, b) => b.depth - a.depth);
   for (const it of items) it.draw();
 
+  // Snap indicator (when ruler active and cursor hovering near a vertex)
+  if (ruler.active && view.ortho && ruler.hover) {
+    ctx.save();
+    const hp = project(ruler.hover.wp[0], ruler.hover.wp[1], ruler.hover.wp[2], w, h);
+    ctx.strokeStyle = "#4caf7d";
+    ctx.fillStyle = "rgba(76,175,125,0.18)";
+    ctx.lineWidth = 2;
+    // green diamond at snap point
+    ctx.beginPath();
+    ctx.moveTo(hp.sx, hp.sy - 9);
+    ctx.lineTo(hp.sx + 9, hp.sy);
+    ctx.lineTo(hp.sx, hp.sy + 9);
+    ctx.lineTo(hp.sx - 9, hp.sy);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    // small dot in the middle
+    ctx.fillStyle = "#4caf7d";
+    ctx.beginPath(); ctx.arc(hp.sx, hp.sy, 2, 0, Math.PI*2); ctx.fill();
+    // label tooltip
+    ctx.font = "11px Segoe UI, sans-serif";
+    const lbl = ruler.hover.label;
+    const tw = ctx.measureText(lbl).width;
+    ctx.fillStyle = "rgba(20,30,25,0.92)";
+    ctx.fillRect(hp.sx + 14, hp.sy - 22, tw + 12, 20);
+    ctx.fillStyle = "#9ee5b8";
+    ctx.fillText(lbl, hp.sx + 20, hp.sy - 8);
+    ctx.restore();
+  }
+
   // Ruler overlay (ortho modes only) — re-project world points each frame
   if (ruler.active && view.ortho && ruler.pts.length > 0) {
     ctx.save();
@@ -660,6 +742,38 @@ function render() {
       ctx.fillStyle = "#ff6450";
       ctx.fillText(String(i + 1), p.sx + 9, p.sy - 8);
     });
+    // Live preview line khi đã có 1 điểm, vẽ tới snap/cursor
+    if (sp.length === 1 && ruler.mouse) {
+      const p1 = sp[0];
+      let p2x = ruler.mouse.sx, p2y = ruler.mouse.sy;
+      let provWp = null;
+      if (ruler.hover) {
+        const ph = project(ruler.hover.wp[0], ruler.hover.wp[1], ruler.hover.wp[2], w, h);
+        p2x = ph.sx; p2y = ph.sy;
+        provWp = ruler.hover.wp;
+      } else if (ruler.axis !== 'free') {
+        if (ruler.axis === 'h') p2y = p1.sy;
+        else p2x = p1.sx;
+      }
+      if (!provWp) provWp = unproject(p2x, p2y);
+      ctx.strokeStyle = "rgba(255,100,80,0.55)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(p1.sx, p1.sy); ctx.lineTo(p2x, p2y); ctx.stroke();
+      ctx.setLineDash([]);
+      const dxW = (provWp[0] - ruler.pts[0][0]) * 1000;
+      const dyW = (provWp[1] - ruler.pts[0][1]) * 1000;
+      const dzW = (provWp[2] - ruler.pts[0][2]) * 1000;
+      const dist = Math.hypot(dxW, dyW, dzW);
+      const mx = (p1.sx + p2x) / 2, my = (p1.sy + p2y) / 2;
+      const txt = dist.toFixed(0) + ' mm';
+      ctx.font = "12px Segoe UI, sans-serif";
+      const tw = ctx.measureText(txt).width;
+      ctx.fillStyle = "rgba(255,100,80,0.7)";
+      ctx.fillRect(mx - tw/2 - 5, my - 20, tw + 10, 18);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(txt, mx - tw/2, my - 7);
+    }
     if (sp.length === 2) {
       const [a, b] = sp;
       ctx.strokeStyle = "#ff6450"; ctx.lineWidth = 2;
@@ -863,15 +977,21 @@ window.addEventListener("mouseup", e => {
     if (ruler.active && view.ortho) {
       const rect = canvas.getBoundingClientRect();
       let px = e.clientX - rect.left, py = e.clientY - rect.top;
-      // axis snap: lock point 2 to share screen-X or screen-Y with point 1
-      if (ruler.pts.length === 1 && ruler.axis !== 'free') {
-        const w = canvas.clientWidth, h = canvas.clientHeight;
-        const p1 = project(ruler.pts[0][0], ruler.pts[0][1], ruler.pts[0][2], w, h);
-        if (ruler.axis === 'h') py = p1.sy;       // khóa trục ngang
-        else if (ruler.axis === 'v') px = p1.sx;  // khóa trục dọc
+      // Ưu tiên 1: bắt điểm vào vertex của geometry
+      if (ruler.hover) {
+        if (ruler.pts.length >= 2) ruler.pts = [];
+        ruler.pts.push(ruler.hover.wp.slice());
+      } else {
+        // Ưu tiên 2: khóa trục
+        if (ruler.pts.length === 1 && ruler.axis !== 'free') {
+          const w = canvas.clientWidth, h = canvas.clientHeight;
+          const p1 = project(ruler.pts[0][0], ruler.pts[0][1], ruler.pts[0][2], w, h);
+          if (ruler.axis === 'h') py = p1.sy;
+          else if (ruler.axis === 'v') px = p1.sx;
+        }
+        if (ruler.pts.length >= 2) ruler.pts = [];
+        ruler.pts.push(unproject(px, py));
       }
-      if (ruler.pts.length >= 2) ruler.pts = [];
-      ruler.pts.push(unproject(px, py));
     }
   }
   dragging = false;
@@ -891,6 +1011,24 @@ window.addEventListener("mousemove", e => {
     view.pitch = Math.max(-1.4, Math.min(1.4, view.pitch + dy * 0.01));
   }
 });
+
+// Snap detection — when ruler active in ortho mode, find nearest geometry point
+canvas.addEventListener("mousemove", e => {
+  if (!ruler.active || !view.ortho || dragging) { ruler.hover = null; ruler.mouse = null; return; }
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  ruler.mouse = { sx: px, sy: py };
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const snapPts = getSnapPoints();
+  let best = null, bestD = 14; // bán kính hít (px)
+  for (const it of snapPts) {
+    const sp = project(it.wp[0], it.wp[1], it.wp[2], w, h);
+    const d = Math.hypot(sp.sx - px, sp.sy - py);
+    if (d < bestD) { bestD = d; best = { wp: it.wp, sp, label: it.label }; }
+  }
+  ruler.hover = best;
+});
+canvas.addEventListener("mouseleave", () => { ruler.hover = null; ruler.mouse = null; });
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
   if (view.ortho) {
@@ -943,6 +1081,7 @@ function updateRulerBtn() {
   const btn = document.getElementById('rulerToggle');
   btn.classList.toggle('on', ruler.active);
   btn.textContent = ruler.active ? '📏 Tắt thước đo' : '📏 Bật thước đo';
+  canvas.style.cursor = ruler.active ? 'crosshair' : 'grab';
 }
 
 function setViewMode(mode) {
